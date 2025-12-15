@@ -207,6 +207,54 @@ def load_model() -> bool:
         return False
 
 
+def unload_model() -> bool:
+    """
+    Unloads the TTS model from memory to free VRAM.
+    This is used for TTL-based memory management.
+
+    Returns:
+        bool: True if the model was unloaded, False if it wasn't loaded.
+    """
+    global chatterbox_model, MODEL_LOADED
+
+    if chatterbox_model is None:
+        logger.info("Model is not loaded, nothing to unload.")
+        return False
+
+    try:
+        logger.info("Unloading Chatterbox TTS model from memory...")
+
+        # Delete the model reference
+        del chatterbox_model
+        chatterbox_model = None
+        MODEL_LOADED = False
+
+        # Clear CUDA cache if available
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            logger.debug("CUDA cache cleared.")
+
+        # Clear MPS cache if available
+        if torch.backends.mps.is_available():
+            try:
+                torch.mps.empty_cache()
+                logger.debug("MPS cache cleared.")
+            except Exception:
+                pass  # MPS cache clearing may not be available in all versions
+
+        # Force garbage collection
+        import gc
+        gc.collect()
+
+        logger.info("Chatterbox TTS model unloaded successfully, VRAM freed.")
+        return True
+
+    except Exception as e:
+        logger.error(f"Error unloading model: {e}", exc_info=True)
+        return False
+
+
 def synthesize(
     text: str,
     audio_prompt_path: Optional[str] = None,

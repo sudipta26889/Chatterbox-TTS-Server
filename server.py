@@ -79,6 +79,13 @@ class OpenAISpeechRequest(BaseModel):
     seed: Optional[int] = None
 
 
+# --- OpenAI Voice Name Mapping ---
+# Maps OpenAI TTS voice names to Chatterbox predefined voices
+OPENAI_VOICE_MAP = {
+    "alloy": "Ryan.wav",
+}
+
+
 # --- Logging Configuration ---
 log_file_path_obj = get_log_file_path()
 log_file_max_size_mb = config_manager.get_int("server.log_file_max_size_mb", 10)
@@ -107,6 +114,12 @@ logger = logging.getLogger(__name__)
 # --- Global Variables & Application Setup ---
 startup_complete_event = threading.Event()  # For coordinating browser opening
 
+# --- TTL Configuration for Model Management ---
+MODEL_TTL_SECONDS = int(os.environ.get("MODEL_TTL_SECONDS", 300))  # 5 minutes default
+_last_used_time = time.time()
+_idle_checker_task = None
+_model_load_lock = threading.Lock()  # Prevent concurrent model loading
+
 
 def _delayed_browser_open(host: str, port: int):
     """
@@ -130,9 +143,62 @@ def _delayed_browser_open(host: str, port: int):
         logger.error(f"Failed to open browser automatically: {e}", exc_info=True)
 
 
+def update_last_used():
+    """Update the last used timestamp when a TTS request is made."""
+    global _last_used_time
+    _last_used_time = time.time()
+
+
+def get_idle_seconds() -> float:
+    """Get the number of seconds since last TTS request."""
+    return time.time() - _last_used_time
+
+
+def ensure_model_loaded() -> bool:
+    """
+    Ensure the TTS model is loaded, loading it if necessary.
+    This enables lazy loading - model loads on first request, not at startup.
+    Returns True if model is loaded, False if loading failed.
+    """
+    if engine.MODEL_LOADED:
+        return True
+
+    with _model_load_lock:
+        # Double-check after acquiring lock
+        if engine.MODEL_LOADED:
+            return True
+
+        logger.info("Model not loaded, loading now (lazy loading)...")
+        if engine.load_model():
+            logger.info("Model loaded successfully via lazy loading.")
+            return True
+        else:
+            logger.error("Failed to load model via lazy loading.")
+            return False
+
+
+async def _idle_checker_loop():
+    """Background task to check for idle timeout and unload model."""
+    global _idle_checker_task
+    logger.info(f"Idle checker started (TTL={MODEL_TTL_SECONDS}s)")
+
+    while True:
+        await asyncio.sleep(30)  # Check every 30 seconds
+        if engine.MODEL_LOADED:
+            idle_time = get_idle_seconds()
+            if idle_time > MODEL_TTL_SECONDS:
+                logger.info(f"Model idle for {idle_time:.0f}s (TTL={MODEL_TTL_SECONDS}s), unloading...")
+                engine.unload_model()
+                logger.info("Model unloaded due to idle timeout.")
+
+
+import asyncio  # Add asyncio import for the idle checker
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manages application startup and shutdown events."""
+    global _idle_checker_task
     logger.info("TTS Server: Initializing application...")
     try:
         logger.info(f"Configuration loaded. Log file at: {get_log_file_path()}")
@@ -149,12 +215,30 @@ async def lifespan(app: FastAPI):
         for p in paths_to_ensure:
             p.mkdir(parents=True, exist_ok=True)
 
-        if not engine.load_model():
-            logger.critical(
-                "CRITICAL: TTS Model failed to load on startup. Server might not function correctly."
-            )
+        # Check if we should load model at startup or use lazy loading
+        lazy_load = os.environ.get("LAZY_LOAD_MODEL", "true").lower() == "true"
+
+        if lazy_load:
+            logger.info(f"Lazy loading enabled - model will load on first TTS request (TTL={MODEL_TTL_SECONDS}s)")
         else:
-            logger.info("TTS Model loaded successfully via engine.")
+            # Original behavior: load model at startup
+            if not engine.load_model():
+                logger.critical(
+                    "CRITICAL: TTS Model failed to load on startup. Server might not function correctly."
+                )
+            else:
+                logger.info("TTS Model loaded successfully via engine.")
+
+        # Start idle checker for TTL-based model management
+        if MODEL_TTL_SECONDS > 0:
+            _idle_checker_task = asyncio.create_task(_idle_checker_loop())
+            logger.info(f"TTL-based model management enabled (timeout={MODEL_TTL_SECONDS}s)")
+        else:
+            logger.info("TTL-based model management disabled (MODEL_TTL_SECONDS <= 0)")
+
+        # Skip browser opening in server/Docker environments
+        skip_browser = os.environ.get("SKIP_BROWSER_OPEN", "true").lower() == "true"
+        if not skip_browser and engine.MODEL_LOADED:
             host_address = get_host()
             server_port = get_port()
             browser_thread = threading.Thread(
@@ -174,6 +258,16 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         logger.info("TTS Server: Application shutdown sequence initiated...")
+        # Cancel idle checker task
+        if _idle_checker_task:
+            _idle_checker_task.cancel()
+            try:
+                await _idle_checker_task
+            except asyncio.CancelledError:
+                pass
+        # Unload model on shutdown
+        if engine.MODEL_LOADED:
+            engine.unload_model()
         logger.info("TTS Server: Application shutdown complete.")
 
 
@@ -246,6 +340,22 @@ except RuntimeError as e_mount_outputs:
 templates = Jinja2Templates(directory=str(ui_static_path))
 
 # --- API Endpoints ---
+
+
+# --- Health Check Endpoint ---
+@app.get("/health", tags=["Health"])
+async def health_check():
+    """
+    Health check endpoint for monitoring and wake-on-request proxy.
+    Returns model status and TTL information.
+    """
+    return {
+        "status": "healthy",
+        "model_loaded": engine.MODEL_LOADED,
+        "idle_seconds": round(get_idle_seconds(), 1),
+        "ttl_seconds": MODEL_TTL_SECONDS,
+        "lazy_load_enabled": os.environ.get("LAZY_LOAD_MODEL", "true").lower() == "true",
+    }
 
 
 # --- Main UI Route ---
@@ -640,12 +750,16 @@ async def custom_tts_endpoint(
     )
     perf_monitor.record("TTS request received")
 
-    if not engine.MODEL_LOADED:
-        logger.error("TTS request failed: Model not loaded.")
+    # Lazy loading: ensure model is loaded
+    if not ensure_model_loaded():
+        logger.error("TTS request failed: Model could not be loaded.")
         raise HTTPException(
             status_code=503,
-            detail="TTS engine model is not currently loaded or available.",
+            detail="TTS engine model could not be loaded. Check server logs for details.",
         )
+
+    # Update last used time for TTL tracking
+    update_last_used()
 
     logger.info(
         f"Received /tts request: mode='{request.voice_mode}', format='{request.output_format}'"
@@ -900,11 +1014,24 @@ async def custom_tts_endpoint(
 
 @app.post("/v1/audio/speech", tags=["OpenAI Compatible"])
 async def openai_speech_endpoint(request: OpenAISpeechRequest):
+    # Lazy loading: ensure model is loaded
+    if not ensure_model_loaded():
+        raise HTTPException(
+            status_code=503,
+            detail="TTS engine model could not be loaded. Check server logs for details.",
+        )
+
+    # Update last used time for TTL tracking
+    update_last_used()
+
     # Determine the audio prompt path based on the voice parameter
+    # Map OpenAI voice names to Chatterbox voices
+    voice_name = OPENAI_VOICE_MAP.get(request.voice, request.voice)
+
     predefined_voices_path = get_predefined_voices_path(ensure_absolute=True)
     reference_audio_path = get_reference_audio_path(ensure_absolute=True)
-    voice_path_predefined = predefined_voices_path / request.voice
-    voice_path_reference = reference_audio_path / request.voice
+    voice_path_predefined = predefined_voices_path / voice_name
+    voice_path_reference = reference_audio_path / voice_name
 
     if voice_path_predefined.is_file():
         audio_prompt_path = voice_path_predefined
@@ -913,13 +1040,6 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
     else:
         raise HTTPException(
             status_code=404, detail=f"Voice file '{request.voice}' not found."
-        )
-
-    # Check if the TTS model is loaded
-    if not engine.MODEL_LOADED:
-        raise HTTPException(
-            status_code=503,
-            detail="TTS engine model is not currently loaded or available.",
         )
 
     try:

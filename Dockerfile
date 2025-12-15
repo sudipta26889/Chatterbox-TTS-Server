@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.8.1-runtime-ubuntu22.04
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
 ARG RUNTIME=nvidia
 
@@ -28,18 +28,32 @@ RUN ln -s /usr/bin/python3 /usr/bin/python
 # Set up working directory
 WORKDIR /app
 
-# Copy requirements first to leverage Docker cache
+# Copy ALL requirements files
 COPY requirements.txt .
-
-# Upgrade pip and install Python dependencies
-RUN pip3 install --no-cache-dir --upgrade pip && \
-    pip3 install --no-cache-dir -r requirements.txt
-# Conditionally install NVIDIA dependencies if RUNTIME is set to 'nvidia'
 COPY requirements-nvidia.txt .
+COPY requirements-rocm.txt .
 
+# Upgrade pip
+RUN pip3 install --no-cache-dir --upgrade pip
+
+# --- CRITICAL FIX: Install PyTorch first, then chatterbox without deps ---
 RUN if [ "$RUNTIME" = "nvidia" ]; then \
-    pip3 install --no-cache-dir -r requirements-nvidia.txt; \
+        echo "Step 1: Installing PyTorch Nightly with sm_120 (Blackwell) support..." && \
+        pip3 install --no-cache-dir --index-url https://download.pytorch.org/whl/nightly/cu128 \
+            torch torchvision torchaudio && \
+        echo "Step 2: Installing chatterbox WITHOUT torch dependency..." && \
+        pip3 install --no-cache-dir --no-deps git+https://github.com/devnen/chatterbox.git && \
+        echo "Step 3: Installing remaining dependencies..." && \
+        pip3 install --no-cache-dir -r requirements-nvidia.txt; \
+    elif [ "$RUNTIME" = "rocm" ]; then \
+        echo "Installing ROCm PyTorch..." && \
+        pip3 install --no-cache-dir -r requirements-rocm.txt; \
+    else \
+        echo "Installing CPU PyTorch..." && \
+        pip3 install --no-cache-dir -r requirements.txt; \
     fi
+# --------------------------------------------------
+
 # Copy the rest of the application code
 COPY . .
 
